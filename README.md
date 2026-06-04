@@ -4,7 +4,7 @@ A NeoForge mod that sets TNT blocks to have negative mass for aeronautic builds 
 
 ## Features
 
-- **TNT Negative Mass**: TNT blocks have a mass of **-10.0 kpg** (kilogram-force)
+- **TNT Negative Mass**: TNT blocks have a mass of **-8.0 kpg** (kilogram-force)
 - **Aeronautic Lift**: TNT-based structures float upward when compiled in Create's stable physics system
 - **Creative Bomb Solutions**: Surround TNT with cobblestone to make it fall and function as traditional bombs
 - **Balanced Gameplay**: High velocity collision threshold ensures only dramatic crashes trigger TNT detonation
