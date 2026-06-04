@@ -91,7 +91,8 @@ The compiled mod JAR will be in `build/libs/`
 ## Technical Details
 
 ### Mass System
-- Base TNT Mass: -10.0 kpg (negative)
+- Base TNT Mass: 2.0 kpg
+- Base TNT Lifting Power: 8.0 kpg
 - Cobblestone Mass: 2.0 kpg (positive, from Sable's #sable:heavy tag)
 - Integration: Through Sable's `sable:mass` configuration system
 
