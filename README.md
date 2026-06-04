@@ -13,7 +13,7 @@ A NeoForge mod that sets TNT blocks to have negative mass for aeronautic builds 
 
 ### Aeronautic Mode
 When TNT blocks are part of a structure compiled with Create mod's stabilization system:
-1. The physics engine reads the TNT mass as -10.0 kpg
+1. The physics engine reads the TNT mass as -8.0 kpg
 2. Negative mass causes upward acceleration on the entire structure
 3. TNT-based aeronautic contraptions float and can be controlled
 
