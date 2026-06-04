@@ -22,19 +22,20 @@ Surround TNT with cobblestone blocks to counteract the negative mass:
 
 **Mass Calculation:**
 - Cobblestone mass: 2.0 kpg per block
-- TNT mass: -10.0 kpg
+- TNT mass: 2.0 kpg
+- TNT Lift strength: 8.0 kpg
 - 6 cobblestone blocks: 6 × 2.0 = 12.0 kpg
-- **Fully enclosed TNT: -10.0 + 12.0 = +2.0 kpg (falls normally)**
+- **Fully enclosed TNT: -8 + 12.0 = +4.0 kpg (falls normally and explodes from significant fall heights)**
 
 | Cobblestone Count | Total Mass | Behavior |
 |---|---|---|
-| 0 | -10.0 | Floats upward |
-| 1 | -8.0 | Floats upward |
-| 2 | -6.0 | Floats upward |
-| 3 | -4.0 | Floats upward |
-| 4 | -2.0 | Floats slowly |
-| 5 | 0.0 | Neutral (hovers) |
-| 6 | +2.0 | **Falls normally** |
+| 0 | -8.0 | Floats upward fast |
+| 1 | -6.0 | Floats upward |
+| 2 | -4.0 | Floats upward |
+| 3 | -2.0 | Floats slowly |
+| 4 | 0.0 | Neutral (hovers) |
+| 5 | +2.0 | **Falls normally** |
+| 6 | +4.0 | **Falls fast** |
 
 ## Building Aeronautic Structures
 
