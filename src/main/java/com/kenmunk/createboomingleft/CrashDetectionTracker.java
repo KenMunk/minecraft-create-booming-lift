@@ -1,46 +1,32 @@
 package com.kenmunk.createboomingleft;
 
-import dev.ryanhcode.sable.Sable;
 import dev.ryanhcode.sable.api.physics.handle.RigidBodyHandle;
 import dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer;
 import dev.ryanhcode.sable.api.sublevel.SubLevelContainer;
+import dev.ryanhcode.sable.companion.math.BoundingBox3ic;
 import dev.ryanhcode.sable.mixinterface.plot.SubLevelContainerHolder;
 import dev.ryanhcode.sable.neoforge.event.ForgeSablePostPhysicsTickEvent;
 import dev.ryanhcode.sable.neoforge.event.ForgeSablePrePhysicsTickEvent;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
-import dev.ryanhcode.sable.sublevel.SubLevel;
-import dev.ryanhcode.sable.sublevel.plot.LevelPlot;
 import dev.ryanhcode.sable.sublevel.system.SubLevelPhysicsSystem;
-import it.unimi.dsi.fastutil.ints.IntArrayList;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.component.DataComponents;
-import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.entity.item.PrimedTnt;
-import net.minecraft.world.entity.projectile.FireworkRocketEntity;
-import net.minecraft.world.item.DyeColor;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.item.component.FireworkExplosion;
-import net.minecraft.world.item.component.Fireworks;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
-import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
-import net.neoforged.neoforge.event.level.ExplosionEvent;
+import net.neoforged.neoforge.event.level.BlockEvent;
 import net.neoforged.neoforge.event.tick.LevelTickEvent;
 import org.joml.Vector3d;
-import dev.ryanhcode.sable.companion.math.BoundingBox3ic;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -49,26 +35,41 @@ import java.util.UUID;
 public class CrashDetectionTracker {
 
     // Velocities are in RigidBodyHandle units (m/s, BepuPhysics2 SI).
-    static final double STARTING_SPEED        = 4.0;
-    static final double DELTA_V               = 4.0;
-    static final int    WINDOW_TICKS          = 2;
-    static final double MIN_IMPULSE_DV        = 1.5;
-    static final int    SUSTAINED_SUBSTEPS    = 5;
-    // Starting speed above which a qualifying collision fires one instant combined
-    // explosion instead of the staggered batch-prime sequence.
-    static final double INSTANT_DETONATE_SPEED = 8.0;
+    static final double STARTING_SPEED     = 4.0;
+    static final double DELTA_V            = 4.0;
+    static final int    WINDOW_TICKS       = 2;
+    static final double MIN_IMPULSE_DV     = 1.5;
+    static final int    SUSTAINED_SUBSTEPS = 5;
 
-    private static final int PRIMES_PER_TICK      = 4;
-    private static final int SMOKE_DURATION_TICKS = 1200; // 60 seconds
-    private static final int SMOKE_EMIT_INTERVAL  = 20;   // once per second
+    private static final int    BLOCKS_PER_SCAN_TICK     = 10;
+    private static final int    HEALTH_RECOVERY_INTERVAL = 200; // ticks between +1 recovery
+    // Fall-damage safe distance analogue (mirrors Minecraft's 3-block safe fall).
+    private static final double COLLISION_SAFE_DV        = 3.0;
+    // Each unit of block mass contributes this many health points to maxHealth.
+    public  static final float  HEALTH_PER_MASS          = 100.0f;
+    // Minimum ticks between two detonations of the same structure.
+    private static final long   DETONATION_COOLDOWN      = 200L;
+
+    /**
+     * Positions being broken by a player this tick. Populated by onBlockBreak,
+     * consumed by ServerLevelPlotMixin.onBlockChange, cleared at end of each tick.
+     * Prevents non-player health reduction from firing on player-initiated breaks.
+     */
+    static final Set<BlockPos> PLAYER_BREAKING =
+            Collections.synchronizedSet(new HashSet<>());
+
+    /**
+     * Called from ServerLevelPlotMixin to check whether a position is being
+     * broken by a player. Consumes the entry so it is not re-used.
+     */
+    public static boolean consumePlayerBreak(final BlockPos pos) {
+        return PLAYER_BREAKING.remove(pos);
+    }
 
     private final Map<UUID, Double>  preSubstepSpeed    = new HashMap<>();
     private final Map<UUID, Integer> fastSubstepStreak  = new HashMap<>();
     private final Map<UUID, Window>  windows            = new HashMap<>();
-    private final Set<UUID>          chainPrimingActive = new HashSet<>();
-    private final Map<ServerLevel, Deque<BatchEntry>>   batchQueue    = new IdentityHashMap<>();
-    private final Map<UUID, Integer>                    batchCount    = new HashMap<>();
-    private final Map<ServerLevel, Map<BlockPos, Long>> smokingBlocks = new IdentityHashMap<>();
+    private final Map<UUID, Long>    lastDetonationTick = new HashMap<>();
 
     private record Window(double startSpeed, long startTick, double peakDeltaV) {
         Window update(double dv) {
@@ -76,19 +77,108 @@ public class CrashDetectionTracker {
         }
     }
 
-    private record BatchEntry(UUID sublevelId, BlockPos pos) {}
+    private record ScheduledSound(ServerLevel level, long tick, double x, double y, double z) {}
+
+    private final List<ScheduledSound> pendingSounds = new ArrayList<>();
 
     public void register() {
         NeoForge.EVENT_BUS.register(this);
     }
 
+    // -------------------------------------------------------------------------
+    // Player-break tracking
+    // -------------------------------------------------------------------------
+
+    @SubscribeEvent
+    public void onBlockBreak(final BlockEvent.BreakEvent event) {
+        if (event.getPlayer() == null) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        final SubLevelContainer container =
+                ((SubLevelContainerHolder) level).sable$getPlotContainer();
+        if (container.inBounds(event.getPos())) {
+            PLAYER_BREAKING.add(event.getPos().immutable());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Physics ticks
+    // -------------------------------------------------------------------------
+
     @SubscribeEvent
     public void onPrePhysicsTick(final ForgeSablePrePhysicsTickEvent event) {
         final SubLevelPhysicsSystem system = event.getPhysicsSystem();
+        final ServerLevel level = system.getLevel();
         for (final ServerSubLevel sublevel : getSubLevels(system)) {
             final RigidBodyHandle handle = system.getPhysicsHandle(sublevel);
             if (handle == null) continue;
             final UUID id = sublevel.getUniqueId();
+
+            // Advance the throttled core-block scan at BLOCKS_PER_SCAN_TICK per tick.
+            if (sublevel instanceof CoreBlockHolder holder) {
+                final int cursor = holder.createBoomingLift$getScanCursor();
+                if (cursor != -1) {
+                    final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
+                    final int xSize = bounds.maxX() - bounds.minX() + 1;
+                    final int ySize = bounds.maxY() - bounds.minY() + 1;
+                    final int zSize = bounds.maxZ() - bounds.minZ() + 1;
+                    final int total = xSize * ySize * zSize;
+                    final int end   = Math.min(cursor + BLOCKS_PER_SCAN_TICK, total);
+
+                    final double cx = (bounds.minX() + bounds.maxX() + 1.0) / 2.0;
+                    final double cy = (bounds.minY() + bounds.maxY() + 1.0) / 2.0;
+                    final double cz = (bounds.minZ() + bounds.maxZ() + 1.0) / 2.0;
+
+                    final Map<BlockPos, Vec3> tntMap     = holder.createBoomingLift$getTntBlocks();
+                    final Map<BlockPos, Vec3> kineticMap = holder.createBoomingLift$getKineticBlocks();
+
+                    for (int i = cursor; i < end; i++) {
+                        final int lx = i % xSize;
+                        final int ly = (i / xSize) % ySize;
+                        final int lz = i / (xSize * ySize);
+                        final BlockPos pos = new BlockPos(
+                                bounds.minX() + lx, bounds.minY() + ly, bounds.minZ() + lz);
+                        final BlockState blockState = level.getBlockState(pos);
+                        final Vec3 relative = new Vec3(
+                                pos.getX() + 0.5 - cx,
+                                pos.getY() + 0.5 - cy,
+                                pos.getZ() + 0.5 - cz);
+
+                        if (blockState.is(Blocks.TNT)) {
+                            if (tntMap.put(pos, relative) == null) {
+                                final float health = CoreBlockHolder.blockMass(blockState) * HEALTH_PER_MASS;
+                                holder.createBoomingLift$setMaxHealth(holder.createBoomingLift$getMaxHealth() + health);
+                                holder.createBoomingLift$setCurrentHealth(holder.createBoomingLift$getCurrentHealth() + health);
+                                holder.createBoomingLift$tryUpdatePeakCount();
+                            }
+                        } else if (isKineticBlock(level, pos)) {
+                            if (kineticMap.put(pos, relative) == null) {
+                                final float health = CoreBlockHolder.blockMass(blockState) * HEALTH_PER_MASS;
+                                holder.createBoomingLift$setMaxHealth(holder.createBoomingLift$getMaxHealth() + health);
+                                holder.createBoomingLift$setCurrentHealth(holder.createBoomingLift$getCurrentHealth() + health);
+                                holder.createBoomingLift$tryUpdatePeakCount();
+                            }
+                        }
+
+                        // Record non-default mass for any block so removal can look it up.
+                        if (!blockState.isAir()) {
+                            final float mass = CoreBlockHolder.blockMass(blockState);
+                            if (mass != 1.0f) {
+                                holder.createBoomingLift$getBlockMasses().put(pos, mass);
+                            }
+                        }
+                    }
+
+                    final int newCursor = end >= total ? -1 : end;
+                    holder.createBoomingLift$setScanCursor(newCursor);
+                    if (newCursor == -1) {
+                        final long now = level.getGameTime();
+                        for (int ring = 0; ring < 3; ring++) {
+                            pendingSounds.add(new ScheduledSound(level, now + ring * 20L, cx, cy, cz));
+                        }
+                    }
+                }
+            }
+
             final double speed = handle.getLinearVelocity(new Vector3d()).length();
             if (!Double.isFinite(speed)) {
                 fastSubstepStreak.remove(id);
@@ -140,257 +230,109 @@ public class CrashDetectionTracker {
             }
 
             if (w.peakDeltaV() >= DELTA_V) {
-                final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
-                final int tntCount = countTnt(level, bounds);
-                if (w.startSpeed() >= INSTANT_DETONATE_SPEED) {
-                    detonateInstantCombined(level, bounds);
-                } else {
-                    scheduleAllTntPriming(level, sublevel);
-                }
-                spawnCriticalFireworks(level, bounds, tntCount);
-                scheduleSmokeForSurvivors(level, bounds);
+                if (!(sublevel instanceof CoreBlockHolder holder)) continue;
+
+                // Apply collision damage using the fall-damage formula.
+                // peakDeltaV is treated as the fall-distance analogue;
+                // COLLISION_SAFE_DV mirrors Minecraft's 3-block safe fall.
+                final float damage = (float) Math.max(0.0, Math.ceil(w.peakDeltaV() - COLLISION_SAFE_DV));
+                holder.createBoomingLift$setCurrentHealth(
+                        Math.max(0, holder.createBoomingLift$getCurrentHealth() - damage));
+
                 windows.remove(id);
+
+                maybeDetonate(holder, sublevel, level, now);
             }
         }
     }
 
-    @SubscribeEvent
-    public void onEntityJoinLevel(final EntityJoinLevelEvent event) {
-        if (!(event.getEntity() instanceof PrimedTnt)) return;
-        if (!(event.getLevel() instanceof ServerLevel level)) return;
-
-        final BlockPos pos = BlockPos.containing(event.getEntity().position());
-        final SubLevel sublevel = Sable.HELPER.getContaining(level, pos);
-        if (!(sublevel instanceof ServerSubLevel serverSubLevel)) return;
-
-        final UUID id = serverSubLevel.getUniqueId();
-        if (!chainPrimingActive.add(id)) return;
-        try {
-            chainPrimeAllTnt(level, serverSubLevel);
-        } finally {
-            chainPrimingActive.remove(id);
-        }
-    }
+    // -------------------------------------------------------------------------
+    // Level tick
+    // -------------------------------------------------------------------------
 
     @SubscribeEvent
     public void onLevelTick(final LevelTickEvent.Post event) {
         if (!(event.getLevel() instanceof ServerLevel level)) return;
         final long now = level.getGameTime();
 
-        // Batch-prime TNT blocks from crash-detonation queue.
-        final Deque<BatchEntry> queue = batchQueue.get(level);
-        if (queue != null) {
-            for (int i = 0; i < PRIMES_PER_TICK && !queue.isEmpty(); i++) {
-                final BatchEntry entry = queue.poll();
-                if (level.getBlockState(entry.pos()).is(Blocks.TNT)) {
-                    Blocks.TNT.onCaughtFire(Blocks.TNT.defaultBlockState(), level, entry.pos(), null, null);
-                    level.setBlock(entry.pos(), Blocks.AIR.defaultBlockState(), 11);
-                }
-                final int remaining = batchCount.merge(entry.sublevelId(), -1, Integer::sum);
-                if (remaining <= 0) {
-                    batchCount.remove(entry.sublevelId());
-                    chainPrimingActive.remove(entry.sublevelId());
-                }
-            }
-            if (queue.isEmpty()) batchQueue.remove(level);
-        }
-
-        // Emit smoke particles for surviving structure blocks once per second.
-        if (now % SMOKE_EMIT_INTERVAL == 0) {
-            final Map<BlockPos, Long> smokeMap = smokingBlocks.get(level);
-            if (smokeMap != null) {
-                smokeMap.entrySet().removeIf(e -> {
-                    if (now >= e.getValue()) return true;
-                    if (!level.getBlockState(e.getKey()).isAir()) {
-                        level.sendParticles(ParticleTypes.LARGE_SMOKE,
-                            e.getKey().getX() + 0.5, e.getKey().getY() + 1.0, e.getKey().getZ() + 0.5,
-                            1, 0.3, 0.0, 0.3, 0.02);
-                    }
-                    return false;
-                });
-                if (smokeMap.isEmpty()) smokingBlocks.remove(level);
-            }
-        }
-    }
-
-    @SubscribeEvent
-    public void onExplosionDetonate(final ExplosionEvent.Detonate event) {
-        if (!(event.getLevel() instanceof ServerLevel level)) return;
-
-        final List<BlockPos> affectedBlocks = event.getAffectedBlocks();
-        final Vec3 center = event.getExplosion().center();
-
-        double maxDistSq = 0.0;
-        for (final BlockPos pos : affectedBlocks) {
-            final double dx = pos.getX() + 0.5 - center.x;
-            final double dy = pos.getY() + 0.5 - center.y;
-            final double dz = pos.getZ() + 0.5 - center.z;
-            maxDistSq = Math.max(maxDistSq, dx * dx + dy * dy + dz * dz);
-        }
-        if (maxDistSq == 0.0) return;
+        // Fire pending bell rings (3 rings, 20 ticks apart, scheduled on scan completion).
+        pendingSounds.removeIf(sound -> {
+            if (sound.level() != level || now < sound.tick()) return false;
+            level.playSound(null, sound.x(), sound.y(), sound.z(),
+                    SoundEvents.BELL_BLOCK, SoundSource.BLOCKS, 2.0f, 1.0f);
+            return true;
+        });
 
         final SubLevelContainer container = ((SubLevelContainerHolder) level).sable$getPlotContainer();
-        if (!(container instanceof ServerSubLevelContainer c)) return;
-
-        final Map<ServerSubLevel, List<BlockPos>> tntBySublevel = new HashMap<>();
-        for (final ServerSubLevel sublevel : c.getAllSubLevels()) {
-            final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
-            if (!aabbIntersectsSphere(bounds, center, maxDistSq)) continue;
-
-            for (final BlockPos pos : BlockPos.betweenClosed(
-                    bounds.minX(), bounds.minY(), bounds.minZ(),
-                    bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-                if (!level.getBlockState(pos).is(Blocks.TNT)) continue;
-                final double dx = pos.getX() + 0.5 - center.x;
-                final double dy = pos.getY() + 0.5 - center.y;
-                final double dz = pos.getZ() + 0.5 - center.z;
-                if (dx * dx + dy * dy + dz * dz <= maxDistSq) {
-                    tntBySublevel.computeIfAbsent(sublevel, k -> new ArrayList<>())
-                                 .add(pos.immutable());
+        if (container instanceof ServerSubLevelContainer c) {
+            // Health recovery: +1 per HEALTH_RECOVERY_INTERVAL ticks, capped at maxCurrentHealth.
+            if (now % HEALTH_RECOVERY_INTERVAL == 0) {
+                for (final ServerSubLevel sublevel : c.getAllSubLevels()) {
+                    if (!(sublevel instanceof CoreBlockHolder holder)) continue;
+                    final float maxCurrent = holder.createBoomingLift$getMaxCurrentHealth();
+                    final float current    = holder.createBoomingLift$getCurrentHealth();
+                    if (current < maxCurrent) {
+                        holder.createBoomingLift$setCurrentHealth(Math.min(current + 1.0f, maxCurrent));
+                    }
                 }
             }
-        }
 
-        if (tntBySublevel.isEmpty()) return;
-
-        final List<BlockPos> allTnt = new ArrayList<>();
-        for (final List<BlockPos> positions : tntBySublevel.values()) {
-            allTnt.addAll(positions);
-        }
-        affectedBlocks.removeAll(allTnt);
-
-        for (final Map.Entry<ServerSubLevel, List<BlockPos>> entry : tntBySublevel.entrySet()) {
-            final UUID id = entry.getKey().getUniqueId();
-            for (final BlockPos pos : entry.getValue()) {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
-            }
-            chainPrimingActive.add(id);
-            try {
-                for (final BlockPos pos : entry.getValue()) {
-                    Blocks.TNT.onCaughtFire(Blocks.TNT.defaultBlockState(), level, pos, null, null);
-                }
-            } finally {
-                chainPrimingActive.remove(id);
+            // Detonation check: catches health reaching 0 via block removal
+            // (onBlockChange path), which isn't covered by onPostPhysicsTick.
+            for (final ServerSubLevel sublevel : c.getAllSubLevels()) {
+                if (!(sublevel instanceof CoreBlockHolder holder)) continue;
+                maybeDetonate(holder, sublevel, level, now);
             }
         }
+
+        PLAYER_BREAKING.clear();
     }
 
-    // Instantly removes all TNT and fires a single combined explosion from the
-    // sublevel centre whose radius equals the sum of all individual TNT radii.
-    private static void detonateInstantCombined(final ServerLevel level, final BoundingBox3ic bounds) {
-        int tntCount = 0;
-        for (final BlockPos pos : BlockPos.betweenClosed(
-                bounds.minX(), bounds.minY(), bounds.minZ(),
-                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            if (level.getBlockState(pos).is(Blocks.TNT)) {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
-                tntCount++;
-            }
-        }
-        if (tntCount == 0) return;
+    // -------------------------------------------------------------------------
+    // Detonation
+    // -------------------------------------------------------------------------
 
-        final double cx = (bounds.minX() + bounds.maxX() + 1.0) / 2.0;
-        final double cy = (bounds.minY() + bounds.maxY() + 1.0) / 2.0;
-        final double cz = (bounds.minZ() + bounds.maxZ() + 1.0) / 2.0;
-        // Each TNT block contributes one vanilla-power (4.0) radius to the combined blast.
-        final float radius = tntCount * 8.0f;
-        level.explode(null, cx, cy, cz, radius, Level.ExplosionInteraction.TNT);
-    }
-
-    private void scheduleAllTntPriming(final ServerLevel level, final ServerSubLevel sublevel) {
-        final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
-        final List<BlockPos> tntPositions = new ArrayList<>();
-        for (final BlockPos pos : BlockPos.betweenClosed(
-                bounds.minX(), bounds.minY(), bounds.minZ(),
-                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            if (level.getBlockState(pos).is(Blocks.TNT)) {
-                tntPositions.add(pos.immutable());
-            }
-        }
-        if (tntPositions.isEmpty()) return;
+    private void maybeDetonate(final CoreBlockHolder holder, final ServerSubLevel sublevel,
+            final ServerLevel level, final long now) {
+        if (holder.createBoomingLift$getCurrentHealth() > 0) return;
+        if (holder.createBoomingLift$getPeakCoreBlockCount() == 0) return;
 
         final UUID id = sublevel.getUniqueId();
-        chainPrimingActive.add(id);
-        batchCount.merge(id, tntPositions.size(), Integer::sum);
-        final Deque<BatchEntry> queue = batchQueue.computeIfAbsent(level, k -> new ArrayDeque<>());
-        for (final BlockPos pos : tntPositions) {
-            queue.add(new BatchEntry(id, pos));
-        }
-    }
+        if (now - lastDetonationTick.getOrDefault(id, 0L) < DETONATION_COOLDOWN) return;
+        lastDetonationTick.put(id, now);
 
-    private static void spawnCriticalFireworks(final ServerLevel level, final BoundingBox3ic bounds, final int tntCount) {
+        final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
         final double cx = (bounds.minX() + bounds.maxX() + 1.0) / 2.0;
         final double cy = (bounds.minY() + bounds.maxY() + 1.0) / 2.0;
         final double cz = (bounds.minZ() + bounds.maxZ() + 1.0) / 2.0;
-        final double spawnRadius = Math.max(10.0, tntCount);
+        final float radius = holder.createBoomingLift$getPeakCoreBlockCount() * 8.0f;
+        level.explode(null, cx, cy, cz, radius, Level.ExplosionInteraction.TNT);
 
-        final IntArrayList colors = new IntArrayList(new int[]{
-            DyeColor.BLACK.getFireworkColor(),
-            DyeColor.GRAY.getFireworkColor()
-        });
-        final FireworkExplosion explosion = new FireworkExplosion(
-            FireworkExplosion.Shape.BURST, colors, new IntArrayList(), false, true);
-        final ItemStack rocket = new ItemStack(Items.FIREWORK_ROCKET);
-        rocket.set(DataComponents.FIREWORKS, new Fireworks(0, List.of(explosion)));
-
-        for (int i = 0; i < 3; i++) {
-            final double angle = level.getRandom().nextDouble() * Math.PI * 2.0;
-            final double dist  = level.getRandom().nextDouble() * spawnRadius;
-            final double ox    = Math.cos(angle) * dist;
-            final double oy    = level.getRandom().nextDouble() * 3.0;
-            final double oz    = Math.sin(angle) * dist;
-            level.addFreshEntity(new FireworkRocketEntity(level, cx + ox, cy + oy, cz + oz, rocket));
+        // Remove any TNT blocks the explosion didn't reach.
+        final Map<BlockPos, Vec3> tntBlocks = holder.createBoomingLift$getTntBlocks();
+        for (final BlockPos tntPos : List.copyOf(tntBlocks.keySet())) {
+            level.setBlock(tntPos, Blocks.AIR.defaultBlockState(), 11);
         }
+        tntBlocks.clear();
     }
 
-    private static int countTnt(final ServerLevel level, final BoundingBox3ic bounds) {
-        int count = 0;
-        for (final BlockPos pos : BlockPos.betweenClosed(
-                bounds.minX(), bounds.minY(), bounds.minZ(),
-                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            if (level.getBlockState(pos).is(Blocks.TNT)) count++;
-        }
-        return count;
-    }
+    // -------------------------------------------------------------------------
+    // Utilities
+    // -------------------------------------------------------------------------
 
-    private void scheduleSmokeForSurvivors(final ServerLevel level, final BoundingBox3ic bounds) {
-        final long expiry = level.getGameTime() + SMOKE_DURATION_TICKS;
-        final Map<BlockPos, Long> smokeMap = smokingBlocks.computeIfAbsent(level, k -> new HashMap<>());
-        for (final BlockPos pos : BlockPos.betweenClosed(
-                bounds.minX(), bounds.minY(), bounds.minZ(),
-                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            final BlockState state = level.getBlockState(pos);
-            if (!state.isAir() && !state.is(Blocks.TNT)) {
-                smokeMap.put(pos.immutable(), expiry);
-            }
-        }
-    }
-
-    private static void chainPrimeAllTnt(final ServerLevel level, final ServerSubLevel sublevel) {
-        final LevelPlot plot = sublevel.getPlot();
-        final BoundingBox3ic bounds = plot.getBoundingBox();
-        for (final BlockPos pos : BlockPos.betweenClosed(
-                bounds.minX(), bounds.minY(), bounds.minZ(),
-                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            if (level.getBlockState(pos).is(Blocks.TNT)) {
-                Blocks.TNT.onCaughtFire(Blocks.TNT.defaultBlockState(), level, pos, null, null);
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
-            }
-        }
+    /**
+     * Returns true if the block at pos is a Create kinetic block entity.
+     * Requires Create as a dependency.
+     */
+    private static boolean isKineticBlock(final ServerLevel level, final BlockPos pos) {
+        // TODO: add Create as a dependency in build.gradle, then replace with:
+        // return level.getBlockEntity(pos) instanceof com.simibubi.create.content.kinetics.base.KineticBlockEntity;
+        return false;
     }
 
     private static List<ServerSubLevel> getSubLevels(final SubLevelPhysicsSystem system) {
         final SubLevelContainer container =
             ((SubLevelContainerHolder) system.getLevel()).sable$getPlotContainer();
         return container instanceof ServerSubLevelContainer c ? c.getAllSubLevels() : List.of();
-    }
-
-    private static boolean aabbIntersectsSphere(
-            final BoundingBox3ic bounds, final Vec3 center, final double radiusSq) {
-        final double cx = Math.max(bounds.minX(), Math.min(center.x, bounds.maxX() + 1.0));
-        final double cy = Math.max(bounds.minY(), Math.min(center.y, bounds.maxY() + 1.0));
-        final double cz = Math.max(bounds.minZ(), Math.min(center.z, bounds.maxZ() + 1.0));
-        final double dx = cx - center.x, dy = cy - center.y, dz = cz - center.z;
-        return dx * dx + dy * dy + dz * dz <= radiusSq;
     }
 }
