@@ -48,7 +48,7 @@ public abstract class ServerLevelPlotMixin {
         final Map<BlockPos, Vec3> tntMap = holder.createBoomingLift$getTntBlocks();
         if (newState.is(Blocks.TNT)) {
             if (tntMap.put(pos.immutable(), relative) == null) {
-                final float health = newMass * CrashDetectionTracker.HEALTH_PER_MASS;
+                final float health = CrashDetectionTracker.HEALTH_PER_CORE_BLOCK;
                 holder.createBoomingLift$setMaxHealth(holder.createBoomingLift$getMaxHealth() + health);
                 holder.createBoomingLift$setCurrentHealth(holder.createBoomingLift$getCurrentHealth() + health);
                 holder.createBoomingLift$tryUpdatePeakCount();
@@ -57,15 +57,29 @@ public abstract class ServerLevelPlotMixin {
                 holder.createBoomingLift$getBlockMasses().put(pos.immutable(), newMass);
             }
         } else {
-            tntMap.remove(pos);
+            final boolean wasTnt     = tntMap.remove(pos) != null;
+            final boolean wasKinetic = holder.createBoomingLift$getKineticBlocks().remove(pos) != null;
 
-            // Non-player block destruction reduces currentHealth by the broken block's mass.
-            // Look up the pre-recorded mass so blocks with non-default masses are handled correctly.
-            if (newState.isAir() && !CrashDetectionTracker.consumePlayerBreak(pos.immutable())) {
-                final Float stored = holder.createBoomingLift$getBlockMasses().get(pos);
-                final float mass = stored != null ? stored : 1.0f;
-                holder.createBoomingLift$setCurrentHealth(
-                        Math.max(0.0f, holder.createBoomingLift$getCurrentHealth() - mass));
+            if (newState.isAir()) {
+                if (CrashDetectionTracker.consumeWrenchBreak(pos.immutable())) {
+                    // Wrench removal: undo the block's health contribution from both
+                    // maxHealth and currentHealth, but clamp currentHealth to 1 so
+                    // wrench removal cannot trigger detonation.
+                    if (wasTnt || wasKinetic) {
+                        final float c = CrashDetectionTracker.HEALTH_PER_CORE_BLOCK;
+                        holder.createBoomingLift$setMaxHealth(
+                                Math.max(0.0f, holder.createBoomingLift$getMaxHealth() - c));
+                        holder.createBoomingLift$setCurrentHealth(
+                                Math.max(1.0f, holder.createBoomingLift$getCurrentHealth() - c));
+                    }
+                } else if (!CrashDetectionTracker.consumePlayerBreak(pos.immutable())) {
+                    // Non-player break: reduce currentHealth by the broken block's mass.
+                    final Float stored = holder.createBoomingLift$getBlockMasses().get(pos);
+                    final float mass = stored != null ? stored : 1.0f;
+                    holder.createBoomingLift$setCurrentHealth(
+                            Math.max(0.0f, holder.createBoomingLift$getCurrentHealth() - mass));
+                }
+                // Normal player break: no health change.
             }
             holder.createBoomingLift$getBlockMasses().remove(pos);
         }

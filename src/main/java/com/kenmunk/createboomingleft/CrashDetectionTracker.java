@@ -10,15 +10,23 @@ import dev.ryanhcode.sable.neoforge.event.ForgeSablePrePhysicsTickEvent;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
 import dev.ryanhcode.sable.sublevel.system.SubLevelPhysicsSystem;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.level.BlockEvent;
 import net.neoforged.neoforge.event.tick.LevelTickEvent;
 import org.joml.Vector3d;
@@ -45,8 +53,8 @@ public class CrashDetectionTracker {
     private static final int    HEALTH_RECOVERY_INTERVAL = 200; // ticks between +1 recovery
     // Fall-damage safe distance analogue (mirrors Minecraft's 3-block safe fall).
     private static final double COLLISION_SAFE_DV        = 3.0;
-    // Each unit of block mass contributes this many health points to maxHealth.
-    public  static final float  HEALTH_PER_MASS          = 100.0f;
+    // Each core block (TNT or kinetic) contributes this many points to maxHealth.
+    public  static final float  HEALTH_PER_CORE_BLOCK    = 20.0f;
     // Minimum ticks between two detonations of the same structure.
     private static final long   DETONATION_COOLDOWN      = 200L;
 
@@ -58,12 +66,22 @@ public class CrashDetectionTracker {
     static final Set<BlockPos> PLAYER_BREAKING =
             Collections.synchronizedSet(new HashSet<>());
 
-    /**
-     * Called from ServerLevelPlotMixin to check whether a position is being
-     * broken by a player. Consumes the entry so it is not re-used.
-     */
     public static boolean consumePlayerBreak(final BlockPos pos) {
         return PLAYER_BREAKING.remove(pos);
+    }
+
+    /**
+     * Positions being removed by a player holding the Create wrench this tick.
+     * Populated by onBlockBreak and onPlayerRightClickBlock, consumed by
+     * ServerLevelPlotMixin.onBlockChange, cleared at end of each tick.
+     * Wrench removal reduces both maxHealth and currentHealth without triggering
+     * detonation (currentHealth is clamped to 1).
+     */
+    static final Set<BlockPos> WRENCH_BREAKING =
+            Collections.synchronizedSet(new HashSet<>());
+
+    public static boolean consumeWrenchBreak(final BlockPos pos) {
+        return WRENCH_BREAKING.remove(pos);
     }
 
     private final Map<UUID, Double>  preSubstepSpeed    = new HashMap<>();
@@ -95,8 +113,24 @@ public class CrashDetectionTracker {
         if (!(event.getLevel() instanceof ServerLevel level)) return;
         final SubLevelContainer container =
                 ((SubLevelContainerHolder) level).sable$getPlotContainer();
-        if (container.inBounds(event.getPos())) {
+        if (!container.inBounds(event.getPos())) return;
+        if (isCreateWrench(event.getPlayer().getMainHandItem())) {
+            WRENCH_BREAKING.add(event.getPos().immutable());
+        } else {
             PLAYER_BREAKING.add(event.getPos().immutable());
+        }
+    }
+
+    // Create's wrench sometimes removes blocks via level.setBlock() rather than the
+    // normal break path, so we also mark the position on right-click to be safe.
+    @SubscribeEvent
+    public void onPlayerRightClickBlock(final PlayerInteractEvent.RightClickBlock event) {
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!isCreateWrench(event.getItemStack())) return;
+        final SubLevelContainer container =
+                ((SubLevelContainerHolder) level).sable$getPlotContainer();
+        if (container.inBounds(event.getPos())) {
+            WRENCH_BREAKING.add(event.getPos().immutable());
         }
     }
 
@@ -145,14 +179,14 @@ public class CrashDetectionTracker {
 
                         if (blockState.is(Blocks.TNT)) {
                             if (tntMap.put(pos, relative) == null) {
-                                final float health = CoreBlockHolder.blockMass(blockState) * HEALTH_PER_MASS;
+                                final float health = HEALTH_PER_CORE_BLOCK;
                                 holder.createBoomingLift$setMaxHealth(holder.createBoomingLift$getMaxHealth() + health);
                                 holder.createBoomingLift$setCurrentHealth(holder.createBoomingLift$getCurrentHealth() + health);
                                 holder.createBoomingLift$tryUpdatePeakCount();
                             }
                         } else if (isKineticBlock(level, pos)) {
                             if (kineticMap.put(pos, relative) == null) {
-                                final float health = CoreBlockHolder.blockMass(blockState) * HEALTH_PER_MASS;
+                                final float health = HEALTH_PER_CORE_BLOCK;
                                 holder.createBoomingLift$setMaxHealth(holder.createBoomingLift$getMaxHealth() + health);
                                 holder.createBoomingLift$setCurrentHealth(holder.createBoomingLift$getCurrentHealth() + health);
                                 holder.createBoomingLift$tryUpdatePeakCount();
@@ -283,9 +317,59 @@ public class CrashDetectionTracker {
                 if (!(sublevel instanceof CoreBlockHolder holder)) continue;
                 maybeDetonate(holder, sublevel, level, now);
             }
+
+            // Progressive health-based smoke and blindness on cached TNT and kinetic blocks.
+            // Smoke begins at 75% of maxCurrentHealth (light) and peaks at 1% (extremely heavy).
+            // Blindness is applied to players on the contraption at ≤ 10%.
+            for (final ServerSubLevel sublevel : c.getAllSubLevels()) {
+                if (!(sublevel instanceof CoreBlockHolder holder)) continue;
+                final float maxCurrent = holder.createBoomingLift$getMaxCurrentHealth();
+                if (maxCurrent <= 0) continue;
+                final float ratio = holder.createBoomingLift$getCurrentHealth() / maxCurrent;
+
+                // Blindness — runs every tick, not interval-gated.
+                if (ratio <= 0.10f) {
+                    final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
+                    for (final ServerPlayer player : level.players()) {
+                        final BlockPos pp = player.blockPosition();
+                        if (pp.getX() >= bounds.minX() && pp.getX() <= bounds.maxX()
+                                && pp.getY() >= bounds.minY() && pp.getY() <= bounds.maxY() + 1
+                                && pp.getZ() >= bounds.minZ() && pp.getZ() <= bounds.maxZ()) {
+                            player.addEffect(new MobEffectInstance(MobEffects.BLINDNESS, 60, 0));
+                        }
+                    }
+                }
+
+                // Smoke — interval-gated.
+                if (ratio > 0.75f) continue;
+
+                // 0.0 at 75% health → 1.0 at 1% health
+                final float intensity = Math.min(1.0f, (0.75f - ratio) / 0.74f);
+                // Emission interval: 40 ticks at minimum intensity → 1 tick at maximum
+                final int interval = Math.max(1, Math.round(40.0f * (1.0f - intensity)));
+                if (now % interval != 0) continue;
+
+                final int    count    = 1 + Math.round(intensity * 4);  // 1 → 5 particles
+                final double spread   = 0.2 + intensity * 0.4;          // 0.2 → 0.6 radius
+                final var    particle = intensity < 0.33f ? ParticleTypes.SMOKE
+                                      : intensity < 0.66f ? ParticleTypes.LARGE_SMOKE
+                                      : ParticleTypes.CAMPFIRE_COSY_SMOKE;
+
+                for (final BlockPos pos : holder.createBoomingLift$getTntBlocks().keySet()) {
+                    level.sendParticles(particle,
+                            pos.getX() + 0.5, pos.getY() + 1.0, pos.getZ() + 0.5,
+                            count, spread, 0.3, spread, 0.02);
+                }
+                for (final BlockPos pos : holder.createBoomingLift$getKineticBlocks().keySet()) {
+                    level.sendParticles(particle,
+                            pos.getX() + 0.5, pos.getY() + 1.0, pos.getZ() + 0.5,
+                            count, spread, 0.3, spread, 0.02);
+                }
+            }
         }
 
         PLAYER_BREAKING.clear();
+        WRENCH_BREAKING.clear();
     }
 
     // -------------------------------------------------------------------------
@@ -319,6 +403,11 @@ public class CrashDetectionTracker {
     // -------------------------------------------------------------------------
     // Utilities
     // -------------------------------------------------------------------------
+
+    private static boolean isCreateWrench(final ItemStack stack) {
+        final ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+        return id != null && "create".equals(id.getNamespace()) && "wrench".equals(id.getPath());
+    }
 
     /**
      * Returns true if the block at pos is a Create kinetic block entity.
