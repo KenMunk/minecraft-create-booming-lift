@@ -46,6 +46,14 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
+import net.minecraft.world.entity.monster.AbstractSkeleton;
+import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.projectile.AbstractArrow;
+import net.minecraft.world.phys.BlockHitResult;
+import net.neoforged.neoforge.event.entity.ProjectileImpactEvent;
 
 public class CrashDetectionTracker {
 
@@ -69,6 +77,8 @@ public class CrashDetectionTracker {
     private static final int    FIRE_SPREAD_INTERVAL = 200;  // ticks between fire-spread events
     private static final int    FIRE_SPREAD_COUNT    = 4;    // fire blocks placed per event
 
+    private static CrashDetectionTracker instance;
+
     private final Map<UUID, SubLevelPhysicsData>        subLevelData  = new HashMap<>();
     private final Map<ServerLevel, Map<BlockPos, Long>> smokingBlocks = new IdentityHashMap<>();
 
@@ -77,7 +87,14 @@ public class CrashDetectionTracker {
     }
 
     public void register() {
+        instance = this;
         NeoForge.EVENT_BUS.register(this);
+    }
+
+    public static void applySentinelDamage(final UUID sublevelId, final double amount) {
+        if (instance == null) return;
+        final SubLevelPhysicsData d = instance.subLevelData.get(sublevelId);
+        if (d != null) d.applyDamage(amount);
     }
 
     // -------------------------------------------------------------------------
@@ -144,11 +161,9 @@ public class CrashDetectionTracker {
                 d.applyCollisionDamage(d.getWindowPeakDeltaV());
 
                 if (d.getWindowStartSpeed() >= INSTANT_DETONATE_SPEED) {
-                    // High-speed crash: fire a single massive explosion whose radius
-                    // is determined by the current core block count (8 × coreCount).
-                    final int coreCount = d.getCurrentCoreBlockTotal();
-                    final int tntCount  = countTnt(level, bounds); // capture before removal
-                    detonateInstantCombined(level, bounds, d, coreCount);
+                    // High-speed crash: begin the iterative detonation sequence.
+                    final int tntCount = countTnt(level, bounds);
+                    startDetonationSequence(level, bounds, d);
                     spawnCriticalFireworks(level, bounds, tntCount);
                 }
 
@@ -161,21 +176,27 @@ public class CrashDetectionTracker {
 
     @SubscribeEvent
     public void onEntityJoinLevel(final EntityJoinLevelEvent event) {
-        if (!(event.getEntity() instanceof PrimedTnt)) return;
         if (!(event.getLevel() instanceof ServerLevel level)) return;
 
-        final BlockPos pos = BlockPos.containing(event.getEntity().position());
-        final SubLevel sublevel = Sable.HELPER.getContaining(level, pos);
-        if (!(sublevel instanceof ServerSubLevel serverSubLevel)) return;
-
-        final UUID id = serverSubLevel.getUniqueId();
-        final SubLevelPhysicsData d = data(id);
-        if (d.isChainPrimingActive()) return;
-        d.activateChainPriming();
-        try {
-            chainPrimeAllTnt(level, serverSubLevel, d);
-        } finally {
-            d.deactivateChainPriming();
+        if (event.getEntity() instanceof PrimedTnt) {
+            final BlockPos pos = BlockPos.containing(event.getEntity().position());
+            final SubLevel sublevel = Sable.HELPER.getContaining(level, pos);
+            if (sublevel instanceof ServerSubLevel serverSubLevel) {
+                final UUID id = serverSubLevel.getUniqueId();
+                final SubLevelPhysicsData d = data(id);
+                if (!d.isChainPrimingActive()) {
+                    d.activateChainPriming();
+                    try {
+                        chainPrimeAllTnt(level, serverSubLevel, d);
+                    } finally {
+                        d.deactivateChainPriming();
+                    }
+                }
+            }
+        } else if (event.getEntity() instanceof Mob mob
+                && (mob instanceof AbstractSkeleton || mob instanceof Creeper)) {
+            // Zombies already target AbstractVillager via their built-in goal; only inject for others.
+            mob.targetSelector.addGoal(3, new NearestAttackableTargetGoal<>(mob, SubLevelSentinelEntity.class, false));
         }
     }
 
@@ -196,21 +217,31 @@ public class CrashDetectionTracker {
                     d.updatePeakCoreBlockCount();
                 }
 
+                // Spawn one sentinel per core block once health is initialized.
+                if (d.isHealthInitialized() && !d.hasSentinelsSpawned()) {
+                    spawnSentinels(level, sublevel.getPlot().getBoundingBox(), d, sublevel.getUniqueId());
+                }
+
                 // Passive health regeneration (1 point per 200 ticks).
                 d.tickRegen(now);
 
                 // Health-scaled smoke particles and blindness effect.
                 tickHealthSmoke(level, sublevel.getPlot().getBoundingBox(), d, now);
 
+                // Drain up to 4 blocks per tick from any active detonation sequence.
+                if (d.hasDetonationPending()) {
+                    drainDetonationQueue(level, d);
+                }
+
                 if (d.isDetonationTriggered()) continue;
 
                 if (d.isDestroyed()) {
-                    // Health reached zero — trigger a final massive explosion.
+                    // Health reached zero — remove sentinels then begin the iterative detonation sequence.
                     d.markDetonationTriggered();
+                    despawnSentinels(level, d);
                     final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
-                    final int tntCount  = countTnt(level, bounds);
-                    final int coreCount = d.getCurrentCoreBlockTotal();
-                    detonateInstantCombined(level, bounds, d, coreCount);
+                    final int tntCount = countTnt(level, bounds);
+                    startDetonationSequence(level, bounds, d);
                     spawnCriticalFireworks(level, bounds, tntCount);
                     scheduleSmokeForSurvivors(level, bounds);
 
@@ -273,6 +304,19 @@ public class CrashDetectionTracker {
             ? BlockBreakCause.PLAYER_MINING
             : BlockBreakCause.UNKNOWN;
         d.onBlockRemoved(pos, event.getState(), level, cause);
+    }
+
+    @SubscribeEvent
+    public void onProjectileImpact(final ProjectileImpactEvent event) {
+        if (!(event.getProjectile().level() instanceof ServerLevel level)) return;
+        if (!(event.getProjectile() instanceof AbstractArrow arrow)) return;
+        if (!(event.getRayTraceResult() instanceof BlockHitResult hit)) return;
+        final BlockPos pos = hit.getBlockPos();
+        final SubLevel sublevel = Sable.HELPER.getContaining(level, pos);
+        if (!(sublevel instanceof ServerSubLevel serverSubLevel)) return;
+        final SubLevelPhysicsData d = subLevelData.get(serverSubLevel.getUniqueId());
+        if (d == null) return;
+        d.applyDamage(arrow.getBaseDamage());
     }
 
     @SubscribeEvent
@@ -341,27 +385,51 @@ public class CrashDetectionTracker {
     // Private helpers
 
     /**
-     * Removes all TNT from the sublevel's plot area, notifies the data object,
-     * then fires one combined explosion whose radius is {@code coreCount × 8}.
-     * This is both the high-speed crash explosion and the health-death explosion.
+     * Scans the sublevel bounds and enqueues every core block position into the
+     * detonation queue. The queue is then drained at 4 blocks/tick by
+     * {@link #drainDetonationQueue}: TNT positions are primed as PrimedTnt entities;
+     * all other core blocks receive a radius-4 explosion at their centre.
      */
-    private static void detonateInstantCombined(final ServerLevel level, final BoundingBox3ic bounds,
-                                                 final SubLevelPhysicsData d, final int coreCount) {
-        if (coreCount <= 0) return;
+    private static void startDetonationSequence(final ServerLevel level,
+                                                 final BoundingBox3ic bounds,
+                                                 final SubLevelPhysicsData d) {
         for (final BlockPos pos : BlockPos.betweenClosed(
                 bounds.minX(), bounds.minY(), bounds.minZ(),
                 bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            final BlockState tntState = level.getBlockState(pos);
-            if (tntState.is(Blocks.TNT)) {
-                d.onBlockRemoved(pos.immutable(), tntState, level, BlockBreakCause.PHYSICS_CRASH);
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
+            final BlockState state = level.getBlockState(pos);
+            for (final CoreBlockType type : CoreBlockType.values()) {
+                if (type.matches(state, pos, level)) {
+                    d.enqueueDetonation(pos.immutable());
+                    break;
+                }
             }
         }
-        final double cx = (bounds.minX() + bounds.maxX() + 1.0) / 2.0;
-        final double cy = (bounds.minY() + bounds.maxY() + 1.0) / 2.0;
-        final double cz = (bounds.minZ() + bounds.maxZ() + 1.0) / 2.0;
-        final float radius = coreCount * 8.0f;
-        level.explode(null, cx, cy, cz, radius, Level.ExplosionInteraction.TNT);
+    }
+
+    /**
+     * Drains up to 4 positions from the detonation queue each call.
+     * TNT is primed and replaced with air; other core blocks trigger a small
+     * explosion (radius 4) at their position. The chain-priming guard is active
+     * for the duration to prevent cascading chain-primes from onEntityJoinLevel.
+     */
+    private static void drainDetonationQueue(final ServerLevel level, final SubLevelPhysicsData d) {
+        final List<BlockPos> batch = d.drainDetonation(4);
+        d.activateChainPriming();
+        try {
+            for (final BlockPos pos : batch) {
+                final BlockState state = level.getBlockState(pos);
+                if (state.is(Blocks.TNT)) {
+                    d.onBlockRemoved(pos, state, level, BlockBreakCause.PHYSICS_CRASH);
+                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
+                    Blocks.TNT.onCaughtFire(Blocks.TNT.defaultBlockState(), level, pos, null, null);
+                } else {
+                    level.explode(null, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5,
+                        4.0f, Level.ExplosionInteraction.TNT);
+                }
+            }
+        } finally {
+            d.deactivateChainPriming();
+        }
     }
 
     /**
@@ -407,10 +475,11 @@ public class CrashDetectionTracker {
 
         // Apply blindness to players within 24 blocks of the sublevel centre.
         if (healthPct <= BLINDNESS_HEALTH) {
-            final double cx = (bounds.minX() + bounds.maxX() + 1.0) / 2.0;
-            final double cy = (bounds.minY() + bounds.maxY() + 1.0) / 2.0;
-            final double cz = (bounds.minZ() + bounds.maxZ() + 1.0) / 2.0;
-            final AABB searchBox = new AABB(cx - 24, cy - 24, cz - 24, cx + 24, cy + 24, cz + 24);
+            // Apply blindness to any player within 5 blocks of the sublevel's block bounds.
+            final AABB searchBox = new AABB(
+                bounds.minX() - 5, bounds.minY() - 5, bounds.minZ() - 5,
+                bounds.maxX() + 6, bounds.maxY() + 6, bounds.maxZ() + 6
+            );
             for (final Player player : level.getEntitiesOfClass(Player.class, searchBox)) {
                 player.addEffect(new MobEffectInstance(MobEffects.BLINDNESS, 60, 0, false, false));
             }
@@ -498,6 +567,35 @@ public class CrashDetectionTracker {
         }
     }
 
+    private static void spawnSentinels(final ServerLevel level, final BoundingBox3ic bounds,
+                                        final SubLevelPhysicsData d, final UUID sublevelId) {
+        for (final BlockPos pos : BlockPos.betweenClosed(
+                bounds.minX(), bounds.minY(), bounds.minZ(),
+                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
+            final BlockState state = level.getBlockState(pos);
+            for (final CoreBlockType type : CoreBlockType.values()) {
+                if (type.matches(state, pos, level)) {
+                    final SubLevelSentinelEntity sentinel =
+                        new SubLevelSentinelEntity(CreateBoomingLiftEntities.SUBLEVEL_SENTINEL.get(), level);
+                    sentinel.setSublevelId(sublevelId);
+                    sentinel.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 0f, 0f);
+                    level.addFreshEntity(sentinel);
+                    d.addSentinelId(sentinel.getUUID());
+                    break;
+                }
+            }
+        }
+        d.markSentinelsSpawned();
+    }
+
+    private static void despawnSentinels(final ServerLevel level, final SubLevelPhysicsData d) {
+        for (final UUID id : d.getSentinelIds()) {
+            final Entity entity = level.getEntity(id);
+            if (entity != null) entity.discard();
+        }
+        d.clearSentinelIds();
+    }
+
     private static void chainPrimeAllTnt(final ServerLevel level, final ServerSubLevel sublevel,
                                           final SubLevelPhysicsData d) {
         final LevelPlot plot = sublevel.getPlot();
@@ -528,4 +626,5 @@ public class CrashDetectionTracker {
         final double dx = cx - center.x, dy = cy - center.y, dz = cz - center.z;
         return dx * dx + dy * dy + dz * dz <= radiusSq;
     }
+
 }

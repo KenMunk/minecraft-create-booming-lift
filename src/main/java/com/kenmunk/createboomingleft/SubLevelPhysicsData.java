@@ -4,10 +4,12 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.state.BlockState;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Per-sublevel state and lifetime statistics for a Sable physics structure.
@@ -245,6 +247,36 @@ public class SubLevelPhysicsData {
         lastRegenTick += points * REGEN_INTERVAL;
         currentHealth = Math.min(getCurrentMaxHealth(), currentHealth + points);
     }
+
+    // -------------------------------------------------------------------------
+    // Detonation queue (drained at 4 blocks/tick by CrashDetectionTracker)
+
+    private final ArrayDeque<BlockPos> detonationQueue = new ArrayDeque<>();
+
+    void enqueueDetonation(final BlockPos pos) { detonationQueue.add(pos); }
+
+    public boolean hasDetonationPending() { return !detonationQueue.isEmpty(); }
+
+    /** Removes and returns up to {@code count} positions from the front of the queue. */
+    public List<BlockPos> drainDetonation(final int count) {
+        final List<BlockPos> batch = new ArrayList<>(count);
+        for (int i = 0; i < count && !detonationQueue.isEmpty(); i++) {
+            batch.add(detonationQueue.poll());
+        }
+        return batch;
+    }
+
+    // -------------------------------------------------------------------------
+    // Sentinel entity tracking
+
+    private boolean sentinelsSpawned = false;
+    private final List<UUID> sentinelIds = new ArrayList<>();
+
+    public boolean hasSentinelsSpawned()        { return sentinelsSpawned; }
+    public void    markSentinelsSpawned()        { sentinelsSpawned = true; }
+    public List<UUID> getSentinelIds()           { return Collections.unmodifiableList(sentinelIds); }
+    public void addSentinelId(final UUID id)     { sentinelIds.add(id); }
+    public void clearSentinelIds()               { sentinelIds.clear(); }
 
     // -------------------------------------------------------------------------
     // Live cache updates (called from CrashDetectionTracker event handlers)
