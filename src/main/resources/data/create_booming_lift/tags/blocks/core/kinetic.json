@@ -1,0 +1,19 @@
+{
+  "replace": false,
+  "values": [
+    { "id": "create:shaft",               "required": false },
+    { "id": "create:cogwheel",            "required": false },
+    { "id": "create:large_cogwheel",      "required": false },
+    { "id": "create:encased_shaft",       "required": false },
+    { "id": "create:gearbox",             "required": false },
+    { "id": "create:water_wheel",         "required": false },
+    { "id": "create:large_water_wheel",   "required": false },
+    { "id": "create:windmill_bearing",    "required": false },
+    { "id": "create:mechanical_bearing",  "required": false },
+    { "id": "create:mechanical_press",    "required": false },
+    { "id": "create:mechanical_mixer",    "required": false },
+    { "id": "create:mechanical_drill",    "required": false },
+    { "id": "create:mechanical_saw",      "required": false },
+    { "id": "create:mechanical_harvester","required": false }
+  ]
+}
