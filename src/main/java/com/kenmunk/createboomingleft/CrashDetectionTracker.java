@@ -16,6 +16,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.item.PrimedTnt;
 import net.minecraft.world.entity.projectile.FireworkRocketEntity;
 import net.minecraft.world.item.DyeColor;
@@ -23,8 +24,11 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.FireworkExplosion;
 import net.minecraft.world.item.component.Fireworks;
-import net.minecraft.world.level.Level;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.component.BundleContents;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.player.Player;
@@ -65,6 +69,7 @@ public class CrashDetectionTracker {
     static final int    SUSTAINED_SUBSTEPS     = 5;
     static final double INSTANT_DETONATE_SPEED = 12.0;
 
+    private static final int    BUNDLE_MAX_WEIGHT     = 2048;
     private static final int   SMOKE_DURATION_TICKS  = 1200; // 60 s
     private static final int   SMOKE_EMIT_INTERVAL   = 20;   // once per second
     // Probability per tick of igniting one random TNT block when health < 5 %.
@@ -106,6 +111,10 @@ public class CrashDetectionTracker {
             final UUID id = sublevel.getUniqueId();
             final SubLevelPhysicsData d = data(id);
 
+            if (!d.isSpawnTickSet()) {
+                d.setSpawnTick(system.getLevel().getGameTime());
+            }
+
             if (!d.hasScan()) {
                 final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
                 d.setScan(new SubLevelScan(
@@ -117,7 +126,13 @@ public class CrashDetectionTracker {
 
             final RigidBodyHandle handle = system.getPhysicsHandle(sublevel);
             if (handle == null) continue;
-            final double speed = handle.getLinearVelocity(new Vector3d()).length();
+            final double speed;
+            try {
+                speed = handle.getLinearVelocity(new Vector3d()).length();
+            } catch (RuntimeException e) {
+                d.clearSpeedTracking();
+                continue;
+            }
             if (!Double.isFinite(speed)) {
                 d.clearSpeedTracking();
                 continue;
@@ -142,8 +157,14 @@ public class CrashDetectionTracker {
             final RigidBodyHandle handle = system.getPhysicsHandle(sublevel);
             if (handle == null) continue;
 
-            final double pre  = d.getPreSubstepSpeed();
-            final double post = handle.getLinearVelocity(new Vector3d()).length();
+            final double pre = d.getPreSubstepSpeed();
+            final double post;
+            try {
+                post = handle.getLinearVelocity(new Vector3d()).length();
+            } catch (RuntimeException e) {
+                d.clearSpeedTracking();
+                continue;
+            }
             final double dv   = Math.max(0.0, pre - post);
 
             if (d.isWindowExpired(now, WINDOW_TICKS)) d.clearWindow();
@@ -155,20 +176,26 @@ public class CrashDetectionTracker {
             else                d.updateWindow(dv);
 
             if (d.getWindowPeakDeltaV() >= DELTA_V) {
-                final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
+                // Grace period only applies to structures with explosives — it exists solely to
+                // prevent TNT from detonating due to physics settling on world load.
+                final boolean inGrace = d.isInGracePeriod(now) && !d.getExplosiveBlockCache().isEmpty();
+                if (!inGrace) {
+                    final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
 
-                // Apply fall-damage-equivalent health loss from the collision.
-                d.applyCollisionDamage(d.getWindowPeakDeltaV());
+                    // Apply fall-damage-equivalent health loss from the collision.
+                    d.applyCollisionDamage(d.getWindowPeakDeltaV());
 
-                if (d.getWindowStartSpeed() >= INSTANT_DETONATE_SPEED) {
-                    // High-speed crash: begin the iterative detonation sequence.
-                    final int tntCount = countTnt(level, bounds);
-                    startDetonationSequence(level, bounds, d);
-                    spawnCriticalFireworks(level, bounds, tntCount);
+                    if (d.getWindowStartSpeed() >= INSTANT_DETONATE_SPEED) {
+                        // High-speed crash: begin the iterative detonation sequence.
+                        final int tntCount = countTnt(level, bounds);
+                        startDetonationSequence(level, bounds, d);
+                        spawnCriticalFireworks(level, bounds, tntCount);
+                    }
+
+                    d.recordCrash(d.getWindowPeakDeltaV());
+                    scheduleSmokeForSurvivors(level, bounds);
                 }
 
-                d.recordCrash(d.getWindowPeakDeltaV());
-                scheduleSmokeForSurvivors(level, bounds);
                 d.clearWindow();
             }
         }
@@ -228,9 +255,15 @@ public class CrashDetectionTracker {
                 // Health-scaled smoke particles and blindness effect.
                 tickHealthSmoke(level, sublevel.getPlot().getBoundingBox(), d, now);
 
-                // Drain up to 4 blocks per tick from any active detonation sequence.
                 if (d.hasDetonationPending()) {
                     drainDetonationQueue(level, d);
+                    // Spawn bundles inline if this batch emptied the queue — the sublevel
+                    // may be removed from sc.getAllSubLevels() before the next tick.
+                    if (!d.hasDetonationPending() && d.hasCollectedDrops() && !d.areBundlesDropped()) {
+                        spawnBundles(level, d);
+                    }
+                } else if (d.hasCollectedDrops() && !d.areBundlesDropped()) {
+                    spawnBundles(level, d);
                 }
 
                 if (d.isDetonationTriggered()) continue;
@@ -384,52 +417,77 @@ public class CrashDetectionTracker {
     // -------------------------------------------------------------------------
     // Private helpers
 
-    /**
-     * Scans the sublevel bounds and enqueues every core block position into the
-     * detonation queue. The queue is then drained at 4 blocks/tick by
-     * {@link #drainDetonationQueue}: TNT positions are primed as PrimedTnt entities;
-     * all other core blocks receive a radius-4 explosion at their centre.
-     */
+    /** Enqueues every non-air block in the sublevel for iterative collection into bundles. */
     private static void startDetonationSequence(final ServerLevel level,
                                                  final BoundingBox3ic bounds,
                                                  final SubLevelPhysicsData d) {
+        d.setDropCenter(new Vec3(
+            (bounds.minX() + bounds.maxX() + 1.0) / 2.0,
+            (bounds.minY() + bounds.maxY() + 1.0) / 2.0,
+            (bounds.minZ() + bounds.maxZ() + 1.0) / 2.0
+        ));
         for (final BlockPos pos : BlockPos.betweenClosed(
                 bounds.minX(), bounds.minY(), bounds.minZ(),
                 bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
-            final BlockState state = level.getBlockState(pos);
-            for (final CoreBlockType type : CoreBlockType.values()) {
-                if (type.matches(state, pos, level)) {
-                    d.enqueueDetonation(pos.immutable());
-                    break;
-                }
+            if (!level.getBlockState(pos).isAir()) {
+                d.enqueueDetonation(pos.immutable());
             }
         }
     }
 
     /**
-     * Drains up to 4 positions from the detonation queue each call.
-     * TNT is primed and replaced with air; other core blocks trigger a small
-     * explosion (radius 4) at their position. The chain-priming guard is active
-     * for the duration to prevent cascading chain-primes from onEntityJoinLevel.
+     * Drains up to 4 block positions per call. Container inventories are extracted
+     * and loot-table drops are collected into the sublevel's drop list; then the
+     * block is removed with break effects but without scattering items.
+     * Positions already cleared by a prior explosion are skipped.
      */
     private static void drainDetonationQueue(final ServerLevel level, final SubLevelPhysicsData d) {
-        final List<BlockPos> batch = d.drainDetonation(4);
-        d.activateChainPriming();
-        try {
-            for (final BlockPos pos : batch) {
-                final BlockState state = level.getBlockState(pos);
-                if (state.is(Blocks.TNT)) {
-                    d.onBlockRemoved(pos, state, level, BlockBreakCause.PHYSICS_CRASH);
-                    level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
-                    Blocks.TNT.onCaughtFire(Blocks.TNT.defaultBlockState(), level, pos, null, null);
-                } else {
-                    level.explode(null, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5,
-                        4.0f, Level.ExplosionInteraction.TNT);
+        for (final BlockPos pos : d.drainDetonation(4)) {
+            final BlockState state = level.getBlockState(pos);
+            if (state.isAir()) continue;
+            final BlockEntity be = level.getBlockEntity(pos);
+            if (be instanceof Container container) {
+                for (int i = 0; i < container.getContainerSize(); i++) {
+                    d.addCollectedDrop(container.getItem(i));
+                    container.setItem(i, ItemStack.EMPTY);
                 }
             }
-        } finally {
-            d.deactivateChainPriming();
+            for (final ItemStack drop : Block.getDrops(state, level, pos, be)) {
+                d.addCollectedDrop(drop);
+            }
+            level.destroyBlock(pos, false);
         }
+    }
+
+    /** Packs all collected drops into bundles capped at BUNDLE_MAX_WEIGHT and spawns them at the drop centre. */
+    private static void spawnBundles(final ServerLevel level, final SubLevelPhysicsData d) {
+        d.markBundlesDropped();
+        final Vec3 center = d.getDropCenter();
+        if (center == null || !d.hasCollectedDrops()) return;
+
+        final List<ItemStack> current = new ArrayList<>();
+        int weight = 0;
+
+        for (final ItemStack stack : d.getCollectedDrops()) {
+            final int w = (64 / Math.max(1, stack.getMaxStackSize())) * stack.getCount();
+            if (weight + w > BUNDLE_MAX_WEIGHT && !current.isEmpty()) {
+                spawnBundleAt(level, current, center);
+                current.clear();
+                weight = 0;
+            }
+            current.add(stack);
+            weight += w;
+        }
+        if (!current.isEmpty()) spawnBundleAt(level, current, center);
+    }
+
+    private static void spawnBundleAt(final ServerLevel level, final List<ItemStack> items, final Vec3 center) {
+        final ItemStack bundle = new ItemStack(Items.BUNDLE);
+        bundle.set(DataComponents.BUNDLE_CONTENTS, new BundleContents(new ArrayList<>(items)));
+        final double vx = (level.getRandom().nextDouble() - 0.5) * 0.3;
+        final double vy = level.getRandom().nextDouble() * 0.3 + 0.1;
+        final double vz = (level.getRandom().nextDouble() - 0.5) * 0.3;
+        level.addFreshEntity(new ItemEntity(level, center.x, center.y + 0.5, center.z, bundle, vx, vy, vz));
     }
 
     /**

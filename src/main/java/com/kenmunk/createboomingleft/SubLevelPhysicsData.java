@@ -2,7 +2,9 @@ package com.kenmunk.createboomingleft;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -16,6 +18,16 @@ import java.util.UUID;
  * One instance lives in CrashDetectionTracker per active ServerSubLevel UUID.
  */
 public class SubLevelPhysicsData {
+
+    // --- load grace period (200 ticks = 10 s; collision damage suppressed while settling) ---
+    private static final int GRACE_PERIOD_TICKS = 200;
+    private long spawnTick = Long.MIN_VALUE;
+
+    public boolean isSpawnTickSet()              { return spawnTick != Long.MIN_VALUE; }
+    public void    setSpawnTick(final long tick) { this.spawnTick = tick; }
+    public boolean isInGracePeriod(final long now) {
+        return spawnTick != Long.MIN_VALUE && (now - spawnTick) < GRACE_PERIOD_TICKS;
+    }
 
     // --- velocity / streak tracking ---
     private boolean hasPreSubstepSpeed = false;
@@ -149,10 +161,11 @@ public class SubLevelPhysicsData {
     // Health system
 
     // One point of damage per REGEN_INTERVAL ticks recovered passively.
-    static  final int    MAX_HEALTH_MULTIPLIER = 20;
-    private static final double FALL_GRACE     = 3.0;   // delta-V free before collision damage
-    private static final double LOW_HEALTH_PCT = 0.05;  // 5 % of max health
-    private static final int    REGEN_INTERVAL = 200;   // ticks per 1-point regen
+    static  final int    MAX_HEALTH_MULTIPLIER  = 20;
+    private static final double CORELESS_HEALTH = 3.0; // health for structures with no core blocks
+    private static final double FALL_GRACE      = 3.0;  // delta-V free before collision damage
+    private static final double LOW_HEALTH_PCT  = 0.05; // 5 % of max health
+    private static final int    REGEN_INTERVAL  = 200;  // ticks per 1-point regen
 
     private int     peakCoreBlockCount   = 0;
     private double  currentHealth        = 0.0;
@@ -160,15 +173,18 @@ public class SubLevelPhysicsData {
     private boolean detonationTriggered  = false;
     private long    lastRegenTick        = Long.MIN_VALUE;
 
-    /** Max health = peak core block count × MAX_HEALTH_MULTIPLIER. */
-    public double getMaxHealth() { return peakCoreBlockCount * MAX_HEALTH_MULTIPLIER; }
+    /** Max health = peak core block count × MAX_HEALTH_MULTIPLIER, or CORELESS_HEALTH if no core blocks. */
+    public double getMaxHealth() {
+        return peakCoreBlockCount > 0 ? peakCoreBlockCount * MAX_HEALTH_MULTIPLIER : CORELESS_HEALTH;
+    }
 
     /**
      * Current health ceiling = maxHealth × (liveTotal / peakTotal).
      * Shrinks proportionally as core blocks are lost; never exceeds maxHealth.
+     * Returns CORELESS_HEALTH for structures that have no core blocks.
      */
     public double getCurrentMaxHealth() {
-        if (peakCoreBlockCount == 0) return 0.0;
+        if (peakCoreBlockCount == 0) return CORELESS_HEALTH;
         return getMaxHealth() * ((double) getCurrentCoreBlockTotal() / peakCoreBlockCount);
     }
 
@@ -180,8 +196,7 @@ public class SubLevelPhysicsData {
 
     /** True when current health is below LOW_HEALTH_PCT of the maximum. */
     public boolean isLowHealth() {
-        return healthInitialized && peakCoreBlockCount > 0
-            && currentHealth < getMaxHealth() * LOW_HEALTH_PCT;
+        return healthInitialized && currentHealth < getMaxHealth() * LOW_HEALTH_PCT;
     }
 
     public boolean isHealthInitialized()    { return healthInitialized; }
@@ -198,8 +213,7 @@ public class SubLevelPhysicsData {
         final int total = getCurrentCoreBlockTotal();
         if (total > peakCoreBlockCount) peakCoreBlockCount = total;
 
-        if (!healthInitialized && peakCoreBlockCount > 0
-                && scan != null && scan.isComplete()) {
+        if (!healthInitialized && scan != null && scan.isComplete()) {
             healthInitialized = true;
             currentHealth = getMaxHealth();
         }
@@ -249,7 +263,7 @@ public class SubLevelPhysicsData {
     }
 
     // -------------------------------------------------------------------------
-    // Detonation queue (drained at 4 blocks/tick by CrashDetectionTracker)
+    // Detonation queue — phase 1: catalog all blocks (4 blocks/tick)
 
     private final ArrayDeque<BlockPos> detonationQueue = new ArrayDeque<>();
 
@@ -265,6 +279,21 @@ public class SubLevelPhysicsData {
         }
         return batch;
     }
+
+    // -------------------------------------------------------------------------
+    // Bundle drop tracking
+
+    private final ArrayList<ItemStack> collectedDrops = new ArrayList<>();
+    private Vec3 dropCenter = null;
+    private boolean bundlesDropped = false;
+
+    void    addCollectedDrop(final ItemStack stack) { if (!stack.isEmpty()) collectedDrops.add(stack.copy()); }
+    public  boolean hasCollectedDrops()             { return !collectedDrops.isEmpty(); }
+    public  List<ItemStack> getCollectedDrops()     { return collectedDrops; }
+    public  void setDropCenter(final Vec3 center)   { this.dropCenter = center; }
+    public  Vec3 getDropCenter()                    { return dropCenter; }
+    public  void markBundlesDropped()               { bundlesDropped = true; }
+    public  boolean areBundlesDropped()             { return bundlesDropped; }
 
     // -------------------------------------------------------------------------
     // Sentinel entity tracking
