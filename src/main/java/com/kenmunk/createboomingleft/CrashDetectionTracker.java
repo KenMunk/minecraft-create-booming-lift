@@ -55,6 +55,8 @@ import net.neoforged.fml.loading.FMLPaths;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -116,6 +118,25 @@ public class CrashDetectionTracker {
         if (instance == null) return;
         final SubLevelPhysicsData d = instance.subLevelData.get(sublevelId);
         if (d != null) d.applyDamage(amount);
+    }
+
+    /** Called from {@link com.kenmunk.createboomingleft.mixin.SubLevelNameMixin} when a nameplate sets a sublevel name. */
+    public static void onSubLevelNameChanged(final ServerLevel level, final SubLevel sublevel) {
+        if (instance == null) return;
+        final SubLevelPhysicsData d = instance.subLevelData.get(sublevel.getUniqueId());
+        if (d == null || !d.isInitialBackupSaved()) return;
+
+        final String raw = sublevel.getName();
+        if (raw == null || raw.isBlank()) return;
+
+        final String sanitized = sanitizeSubLevelName(raw);
+        if (sanitized.isEmpty() || sanitized.equals(d.getSubLevelName())) return;
+
+        final String unique = resolveUniqueName(sanitized, d.getSubLevelName());
+        renameBackupFile(d.getSubLevelName(), unique);
+        d.setSubLevelName(unique);
+        saveSubLevelBackup(level, sublevel.getPlot().getBoundingBox(), unique);
+        d.recordBackupSaved(level.getGameTime());
     }
 
     // -------------------------------------------------------------------------
@@ -200,7 +221,6 @@ public class CrashDetectionTracker {
 
                     // Apply fall-damage-equivalent health loss from the collision.
                     d.applyCollisionDamage(d.getWindowPeakDeltaV());
-                    d.markNeedsNewBackupFile();
 
                     if (d.getWindowStartSpeed() >= INSTANT_DETONATE_SPEED) {
                         // High-speed crash: begin the iterative detonation sequence.
@@ -265,11 +285,19 @@ public class CrashDetectionTracker {
                 if (d.hasScan() && !d.getScan().isComplete()) {
                     d.getScan().advance(level, 10);
                     d.updatePeakCoreBlockCount();
-                    if (d.getScan().isComplete() && !d.isInitialBackupSaved()) {
-                        saveSubLevelBackup(level, sublevel.getUniqueId(),
-                                           sublevel.getPlot().getBoundingBox(), d.getBackupVersion());
-                        d.markInitialBackupSaved();
-                        d.recordBackupSaved(now);
+                    if (d.getScan().isComplete() && d.getSubLevelName() == null) {
+                        final String sableName = sublevel.getName();
+                        if (sableName == null || sableName.isBlank()) {
+                            // Freeze the auto-generated name into Sable's own persisted
+                            // sublevel data (display_name) so it survives a server restart
+                            // instead of being regenerated from a (by-then-different) bounding box.
+                            final String unique = resolveUniqueName(
+                                generateSubLevelName(sublevel.getPlot().getBoundingBox()), null);
+                            sublevel.setName(unique);
+                            d.setSubLevelName(unique);
+                        } else {
+                            d.setSubLevelName(resolveUniqueName(sanitizeSubLevelName(sableName), null));
+                        }
                     }
                 }
 
@@ -351,14 +379,8 @@ public class CrashDetectionTracker {
         final SubLevelPhysicsData d = subLevelData.get(serverSubLevel.getUniqueId());
         if (d == null) return;
         d.onBlockAdded(event.getPlacedBlock(), pos, level);
-        if (d.isInitialBackupSaved() && event.getEntity() instanceof Player) {
-            d.consumeNeedsNewBackupFile();
-            final long now = level.getGameTime();
-            if (d.getLastBackupTick() < 0 || (now - d.getLastBackupTick()) >= BACKUP_THROTTLE_TICKS) {
-                saveSubLevelBackup(level, serverSubLevel.getUniqueId(),
-                                   serverSubLevel.getPlot().getBoundingBox(), d.getBackupVersion());
-                d.recordBackupSaved(now);
-            }
+        if (event.getEntity() instanceof Player) {
+            maybeBackupOnPlayerChange(level, serverSubLevel, d);
         }
     }
 
@@ -375,15 +397,23 @@ public class CrashDetectionTracker {
             ? BlockBreakCause.PLAYER_MINING
             : BlockBreakCause.UNKNOWN;
         d.onBlockRemoved(pos, event.getState(), level, cause);
-        if (d.isInitialBackupSaved() && event.getPlayer() != null) {
-            d.consumeNeedsNewBackupFile();
-            final long now = level.getGameTime();
-            if (d.getLastBackupTick() < 0 || (now - d.getLastBackupTick()) >= BACKUP_THROTTLE_TICKS) {
-                saveSubLevelBackup(level, serverSubLevel.getUniqueId(),
-                                   serverSubLevel.getPlot().getBoundingBox(), d.getBackupVersion());
-                d.recordBackupSaved(now);
-            }
+        if (event.getPlayer() != null) {
+            maybeBackupOnPlayerChange(level, serverSubLevel, d);
         }
+    }
+
+    /**
+     * Saves a fresh backup in response to a player-initiated block change, subject to the
+     * per-structure throttle. No-op until the initial scan has assigned a sublevel name.
+     */
+    private static void maybeBackupOnPlayerChange(final ServerLevel level, final ServerSubLevel serverSubLevel,
+                                                    final SubLevelPhysicsData d) {
+        if (d.getSubLevelName() == null) return;
+        final long now = level.getGameTime();
+        if (d.isInitialBackupSaved() && (now - d.getLastBackupTick()) < BACKUP_THROTTLE_TICKS) return;
+        saveSubLevelBackup(level, serverSubLevel.getPlot().getBoundingBox(), d.getSubLevelName());
+        d.markInitialBackupSaved();
+        d.recordBackupSaved(now);
     }
 
     @SubscribeEvent
@@ -724,11 +754,11 @@ public class CrashDetectionTracker {
      */
     /**
      * Captures the sublevel's plot region into a vanilla StructureTemplate and writes it to
-     * schematics/create_booming_lift/<uuid>.nbt inside the game directory — the same root
+     * schematics/create_booming_lift/<name>.nbt inside the game directory — the same root
      * that Create uses for its schematics, making backups visible to Create's schematic tools.
      */
-    private static void saveSubLevelBackup(final ServerLevel level, final UUID uuid,
-                                            final BoundingBox3ic bounds, final int version) {
+    private static void saveSubLevelBackup(final ServerLevel level,
+                                            final BoundingBox3ic bounds, final String name) {
         final StructureTemplate template = new StructureTemplate();
         template.fillFromWorld(level,
             new BlockPos(bounds.minX(), bounds.minY(), bounds.minZ()),
@@ -736,17 +766,61 @@ public class CrashDetectionTracker {
                       bounds.maxY() - bounds.minY() + 1,
                       bounds.maxZ() - bounds.minZ() + 1),
             false, null);
-        final String fileName = version == 0 ? uuid + ".nbt" : uuid + "_" + version + ".nbt";
-        final Path path = FMLPaths.GAMEDIR.get()
-            .resolve("schematics")
-            .resolve(CreateBoomingLift.MOD_ID)
-            .resolve(fileName);
+        final Path path = backupDir().resolve(name + ".nbt");
         try {
             Files.createDirectories(path.getParent());
             NbtIo.writeCompressed(template.save(new CompoundTag()), path);
         } catch (final IOException e) {
             // Backup is best-effort; don't crash the server on I/O failure.
         }
+    }
+
+    /** Root folder for this mod's backups: schematics/create_booming_lift inside the game directory. */
+    private static Path backupDir() {
+        return FMLPaths.GAMEDIR.get().resolve("schematics").resolve(CreateBoomingLift.MOD_ID);
+    }
+
+    /**
+     * Appends a numeric suffix ({@code _2}, {@code _3}, ...) until {@code baseName} no longer
+     * collides with an existing backup file belonging to a different structure. A candidate that
+     * matches {@code excludeName} (the structure's own current backup name) is always accepted.
+     */
+    private static String resolveUniqueName(final String baseName, final String excludeName) {
+        final Path dir = backupDir();
+        String candidate = baseName;
+        int suffix = 2;
+        while (!candidate.equals(excludeName) && Files.exists(dir.resolve(candidate + ".nbt"))) {
+            candidate = baseName + "_" + suffix;
+            suffix++;
+        }
+        return candidate;
+    }
+
+    /** Generates a stable, position-based name for a sublevel from its bounding-box centre. */
+    private static String generateSubLevelName(final BoundingBox3ic bounds) {
+        final int cx = (bounds.minX() + bounds.maxX()) / 2;
+        final int cy = (bounds.minY() + bounds.maxY()) / 2;
+        final int cz = (bounds.minZ() + bounds.maxZ()) / 2;
+        return "structure_" + cx + "_" + cy + "_" + cz;
+    }
+
+    /** Converts a display name from a name tag into a safe filename (lowercase, non-alphanumeric → underscore). */
+    private static String sanitizeSubLevelName(final String raw) {
+        return raw.toLowerCase(Locale.ROOT)
+                  .replaceAll("[^a-z0-9_\\-]", "_")
+                  .replaceAll("_+", "_")
+                  .replaceAll("^_+|_+$", "");
+    }
+
+    /** Renames an existing backup file when a player applies a name tag to the sublevel. */
+    private static void renameBackupFile(final String oldName, final String newName) {
+        if (oldName == null || oldName.equals(newName)) return;
+        final Path dir = backupDir();
+        try {
+            final Path src = dir.resolve(oldName + ".nbt");
+            if (Files.exists(src)) Files.move(src, dir.resolve(newName + ".nbt"),
+                                              StandardCopyOption.REPLACE_EXISTING);
+        } catch (final IOException e) { }
     }
 
     private void removeEmptySublevels(final ServerLevel level, final ServerSubLevelContainer sc) {

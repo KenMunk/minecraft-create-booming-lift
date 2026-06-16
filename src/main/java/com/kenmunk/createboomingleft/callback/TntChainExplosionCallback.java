@@ -26,7 +26,8 @@ public class TntChainExplosionCallback implements BlockSubLevelCollisionCallback
     private TntChainExplosionCallback() {}
 
     @Override
-    public CollisionResult sable$onCollision(final BlockPos blockPos, final Vector3d pos, final double impactVelocity) {
+    public CollisionResult sable$onCollision(final BlockPos blockPos, final BlockPos otherBlockPos,
+                                              final Vector3d pos, final double impactVelocity) {
         if (impactVelocity * impactVelocity < TRIGGER_VELOCITY * TRIGGER_VELOCITY) {
             return CollisionResult.NONE;
         }

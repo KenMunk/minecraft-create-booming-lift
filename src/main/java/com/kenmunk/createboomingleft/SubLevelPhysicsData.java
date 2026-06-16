@@ -299,23 +299,15 @@ public class SubLevelPhysicsData {
     // Backup tracking
 
     private boolean initialBackupSaved = false;
-    private boolean needsNewBackupFile = false;
-    private int     backupVersion      = 0;
     private long    lastBackupTick     = -1L;
+    private String  subLevelName       = null;
 
-    public boolean isInitialBackupSaved()    { return initialBackupSaved; }
-    public void    markInitialBackupSaved()  { initialBackupSaved = true; }
-    public int     getBackupVersion()        { return backupVersion; }
-    public long    getLastBackupTick()       { return lastBackupTick; }
+    public boolean isInitialBackupSaved()             { return initialBackupSaved; }
+    public void    markInitialBackupSaved()           { initialBackupSaved = true; }
+    public long    getLastBackupTick()                { return lastBackupTick; }
     public void    recordBackupSaved(final long tick) { lastBackupTick = tick; }
-    public void    markNeedsNewBackupFile()  { needsNewBackupFile = true; }
-    /** Returns true (and resets the flag) if a collision has occurred since the last player block change. */
-    public boolean consumeNeedsNewBackupFile() {
-        if (!needsNewBackupFile) return false;
-        needsNewBackupFile = false;
-        backupVersion++;
-        return true;
-    }
+    public String  getSubLevelName()                  { return subLevelName; }
+    public void    setSubLevelName(final String name) { subLevelName = name; }
 
     // -------------------------------------------------------------------------
     // Sentinel entity tracking

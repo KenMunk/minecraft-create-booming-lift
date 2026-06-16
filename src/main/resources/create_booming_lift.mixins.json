@@ -3,7 +3,10 @@
   "minVersion": "0.8",
   "package": "com.kenmunk.createboomingleft.mixin",
   "compatibilityLevel": "JAVA_21",
-  "mixins": [],
+  "mixins": [
+    "TntBlockMixin",
+    "SubLevelNameMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }
