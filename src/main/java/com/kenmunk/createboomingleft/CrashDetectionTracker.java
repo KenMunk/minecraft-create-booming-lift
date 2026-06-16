@@ -4,6 +4,7 @@ import dev.ryanhcode.sable.Sable;
 import dev.ryanhcode.sable.api.physics.handle.RigidBodyHandle;
 import dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer;
 import dev.ryanhcode.sable.api.sublevel.SubLevelContainer;
+import dev.ryanhcode.sable.sublevel.storage.SubLevelRemovalReason;
 import dev.ryanhcode.sable.mixinterface.plot.SubLevelContainerHolder;
 import dev.ryanhcode.sable.neoforge.event.ForgeSablePostPhysicsTickEvent;
 import dev.ryanhcode.sable.neoforge.event.ForgeSablePrePhysicsTickEvent;
@@ -40,15 +41,27 @@ import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import net.neoforged.neoforge.event.level.BlockEvent;
 import net.neoforged.neoforge.event.level.ExplosionEvent;
+import net.neoforged.neoforge.event.level.LevelEvent;
 import net.neoforged.neoforge.event.tick.LevelTickEvent;
 import org.joml.Vector3d;
 import dev.ryanhcode.sable.companion.math.BoundingBox3ic;
 
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.core.Vec3i;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
+import net.neoforged.fml.loading.FMLPaths;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
@@ -69,8 +82,9 @@ public class CrashDetectionTracker {
     static final int    SUSTAINED_SUBSTEPS     = 5;
     static final double INSTANT_DETONATE_SPEED = 12.0;
 
-    private static final int    BUNDLE_MAX_WEIGHT     = 2048;
-    private static final int   SMOKE_DURATION_TICKS  = 1200; // 60 s
+    private static final int    BUNDLE_MAX_WEIGHT       = 2048;
+    private static final int    BACKUP_THROTTLE_TICKS   = 12000; // 10 minutes
+    private static final int   SMOKE_DURATION_TICKS    = 1200; // 60 s
     private static final int   SMOKE_EMIT_INTERVAL   = 20;   // once per second
     // Probability per tick of igniting one random TNT block when health < 5 %.
     private static final float  LOW_HEALTH_TNT_CHANCE = 0.005f;
@@ -86,6 +100,8 @@ public class CrashDetectionTracker {
 
     private final Map<UUID, SubLevelPhysicsData>        subLevelData  = new HashMap<>();
     private final Map<ServerLevel, Map<BlockPos, Long>> smokingBlocks = new IdentityHashMap<>();
+    /** Levels that have already had their empty-sublevel cleanup pass run. */
+    private final Set<ServerLevel> cleanedLevels = Collections.newSetFromMap(new IdentityHashMap<>());
 
     private SubLevelPhysicsData data(UUID id) {
         return subLevelData.computeIfAbsent(id, k -> new SubLevelPhysicsData());
@@ -184,6 +200,7 @@ public class CrashDetectionTracker {
 
                     // Apply fall-damage-equivalent health loss from the collision.
                     d.applyCollisionDamage(d.getWindowPeakDeltaV());
+                    d.markNeedsNewBackupFile();
 
                     if (d.getWindowStartSpeed() >= INSTANT_DETONATE_SPEED) {
                         // High-speed crash: begin the iterative detonation sequence.
@@ -228,12 +245,18 @@ public class CrashDetectionTracker {
     }
 
     @SubscribeEvent
+    public void onLevelUnload(final LevelEvent.Unload event) {
+        if (event.getLevel() instanceof ServerLevel level) cleanedLevels.remove(level);
+    }
+
+    @SubscribeEvent
     public void onLevelTick(final LevelTickEvent.Post event) {
         if (!(event.getLevel() instanceof ServerLevel level)) return;
         final long now = level.getGameTime();
 
         final SubLevelContainer container = ((SubLevelContainerHolder) level).sable$getPlotContainer();
         if (container instanceof ServerSubLevelContainer sc) {
+            if (cleanedLevels.add(level)) removeEmptySublevels(level, sc);
             for (final ServerSubLevel sublevel : sc.getAllSubLevels()) {
                 final SubLevelPhysicsData d = subLevelData.get(sublevel.getUniqueId());
                 if (d == null) continue;
@@ -242,6 +265,12 @@ public class CrashDetectionTracker {
                 if (d.hasScan() && !d.getScan().isComplete()) {
                     d.getScan().advance(level, 10);
                     d.updatePeakCoreBlockCount();
+                    if (d.getScan().isComplete() && !d.isInitialBackupSaved()) {
+                        saveSubLevelBackup(level, sublevel.getUniqueId(),
+                                           sublevel.getPlot().getBoundingBox(), d.getBackupVersion());
+                        d.markInitialBackupSaved();
+                        d.recordBackupSaved(now);
+                    }
                 }
 
                 // Spawn one sentinel per core block once health is initialized.
@@ -322,6 +351,15 @@ public class CrashDetectionTracker {
         final SubLevelPhysicsData d = subLevelData.get(serverSubLevel.getUniqueId());
         if (d == null) return;
         d.onBlockAdded(event.getPlacedBlock(), pos, level);
+        if (d.isInitialBackupSaved() && event.getEntity() instanceof Player) {
+            d.consumeNeedsNewBackupFile();
+            final long now = level.getGameTime();
+            if (d.getLastBackupTick() < 0 || (now - d.getLastBackupTick()) >= BACKUP_THROTTLE_TICKS) {
+                saveSubLevelBackup(level, serverSubLevel.getUniqueId(),
+                                   serverSubLevel.getPlot().getBoundingBox(), d.getBackupVersion());
+                d.recordBackupSaved(now);
+            }
+        }
     }
 
     @SubscribeEvent
@@ -337,6 +375,15 @@ public class CrashDetectionTracker {
             ? BlockBreakCause.PLAYER_MINING
             : BlockBreakCause.UNKNOWN;
         d.onBlockRemoved(pos, event.getState(), level, cause);
+        if (d.isInitialBackupSaved() && event.getPlayer() != null) {
+            d.consumeNeedsNewBackupFile();
+            final long now = level.getGameTime();
+            if (d.getLastBackupTick() < 0 || (now - d.getLastBackupTick()) >= BACKUP_THROTTLE_TICKS) {
+                saveSubLevelBackup(level, serverSubLevel.getUniqueId(),
+                                   serverSubLevel.getPlot().getBoundingBox(), d.getBackupVersion());
+                d.recordBackupSaved(now);
+            }
+        }
     }
 
     @SubscribeEvent
@@ -668,6 +715,59 @@ public class CrashDetectionTracker {
                 level.setBlock(pos, Blocks.AIR.defaultBlockState(), 11);
             }
         }
+    }
+
+    /**
+     * Runs once per level load. Removes any sublevel whose plot bounding box contains
+     * no non-air blocks — these are artifact entries left over from a previous session
+     * where the sublevel was destroyed but not fully cleaned up.
+     */
+    /**
+     * Captures the sublevel's plot region into a vanilla StructureTemplate and writes it to
+     * schematics/create_booming_lift/<uuid>.nbt inside the game directory — the same root
+     * that Create uses for its schematics, making backups visible to Create's schematic tools.
+     */
+    private static void saveSubLevelBackup(final ServerLevel level, final UUID uuid,
+                                            final BoundingBox3ic bounds, final int version) {
+        final StructureTemplate template = new StructureTemplate();
+        template.fillFromWorld(level,
+            new BlockPos(bounds.minX(), bounds.minY(), bounds.minZ()),
+            new Vec3i(bounds.maxX() - bounds.minX() + 1,
+                      bounds.maxY() - bounds.minY() + 1,
+                      bounds.maxZ() - bounds.minZ() + 1),
+            false, null);
+        final String fileName = version == 0 ? uuid + ".nbt" : uuid + "_" + version + ".nbt";
+        final Path path = FMLPaths.GAMEDIR.get()
+            .resolve("schematics")
+            .resolve(CreateBoomingLift.MOD_ID)
+            .resolve(fileName);
+        try {
+            Files.createDirectories(path.getParent());
+            NbtIo.writeCompressed(template.save(new CompoundTag()), path);
+        } catch (final IOException e) {
+            // Backup is best-effort; don't crash the server on I/O failure.
+        }
+    }
+
+    private void removeEmptySublevels(final ServerLevel level, final ServerSubLevelContainer sc) {
+        final List<ServerSubLevel> toRemove = new ArrayList<>();
+        for (final ServerSubLevel sublevel : sc.getAllSubLevels()) {
+            if (isSubLevelEmpty(level, sublevel)) toRemove.add(sublevel);
+        }
+        for (final ServerSubLevel sublevel : toRemove) {
+            sc.removeSubLevel(sublevel, SubLevelRemovalReason.REMOVED);
+            subLevelData.remove(sublevel.getUniqueId());
+        }
+    }
+
+    private static boolean isSubLevelEmpty(final ServerLevel level, final ServerSubLevel sublevel) {
+        final BoundingBox3ic bounds = sublevel.getPlot().getBoundingBox();
+        for (final BlockPos pos : BlockPos.betweenClosed(
+                bounds.minX(), bounds.minY(), bounds.minZ(),
+                bounds.maxX(), bounds.maxY(), bounds.maxZ())) {
+            if (!level.getBlockState(pos).isAir()) return false;
+        }
+        return true;
     }
 
     private static List<ServerSubLevel> getSubLevels(final SubLevelPhysicsSystem system) {
